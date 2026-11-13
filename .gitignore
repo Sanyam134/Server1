@@ -1,0 +1,7 @@
+.ssh/
+*.pem
+*-deploy-key
+*-deploy-key.pub
+.env
+.env.*
+.bash_history
