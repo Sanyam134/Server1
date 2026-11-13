@@ -1,0 +1,119 @@
+
+name: AWS EC2 Docker Deployment
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production-deployment
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Build and Deploy
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. Checkout source code
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      # 2. Validate Python application
+      - name: Validate Application
+        run: |
+          python -m compileall -q app
+          echo "Application validation successful"
+
+      # 3. Setup Docker Buildx
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # 4. Docker Hub login
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # 5. Build and push image
+      - name: Build and Push Docker Image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/aws-devops-platform:latest
+            ${{ secrets.DOCKERHUB_USERNAME }}/aws-devops-platform:${{ github.sha }}
+
+      # 6. Connect GitHub runner to private network
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v3
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+
+      # 7. Deploy on EC2
+      - name: Deploy Application on EC2
+        uses: appleboy/ssh-action@v1.2.0
+        env:
+          IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/aws-devops-platform:${{ github.sha }}
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USERNAME }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          port: 22
+          envs: IMAGE
+          script: |
+            set -eu
+
+            echo "Starting deployment..."
+
+            PREVIOUS_IMAGE=$(docker inspect \
+              --format='{{.Config.Image}}' \
+              devops-platform 2>/dev/null || true)
+
+            echo "Pulling new image..."
+            docker pull "$IMAGE"
+
+            echo "Removing previous container..."
+            docker rm -f devops-platform 2>/dev/null || true
+
+            echo "Starting new container..."
+            docker run -d \
+              --name devops-platform \
+              --restart unless-stopped \
+              -p 80:5000 \
+              "$IMAGE"
+
+            echo "Checking application health..."
+
+            for i in $(seq 1 15); do
+              if curl -fsS http://127.0.0.1/health; then
+                echo "Deployment successful!"
+                exit 0
+              fi
+              sleep 2
+            done
+
+            echo "Health check failed!"
+            docker logs --tail 100 devops-platform || true
+
+            echo "Rolling back..."
+
+            docker rm -f devops-platform || true
+
+            if [ -n "$PREVIOUS_IMAGE" ]; then
+              docker run -d \
+                --name devops-platform \
+                --restart unless-stopped \
+                -p 80:5000 \
+                "$PREVIOUS_IMAGE"
+            fi
+
+            exit 1
+
